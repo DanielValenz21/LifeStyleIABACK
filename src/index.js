@@ -10,6 +10,7 @@ const pool          = require('./config/db');
 const authRouter  = require('./routes/auth');
 const plansRouter = require('./routes/plans');
 const aiRouter = require('./routes/ai');
+const remindersRouter = require('./routes/reminders');
 
 const app = express();
 
@@ -59,6 +60,7 @@ app.use('/api-docs', swaggerUi.serve, swaggerUi.setup(swaggerSpec));
 app.use('/auth', authRouter);
 app.use('/plans', plansRouter);
 app.use('/ai', aiRouter);
+app.use('/reminders', remindersRouter);
 
 /**
  * @swagger

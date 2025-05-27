@@ -794,4 +794,75 @@ router.get('/:planId/export', auth, async (req, res) => {
   }
 });
 
+/**
+ * @swagger
+ * /plans/{planId}/reminders:
+ *   get:
+ *     summary: Lista recordatorios de un plan
+ *     tags: [Plans]
+ *     security:
+ *       - bearerAuth: []
+ *     parameters:
+ *       - in: path
+ *         name: planId
+ *         schema:
+ *           type: integer
+ *         required: true
+ *         description: ID del plan
+ *     responses:
+ *       200:
+ *         description: Array de recordatorios
+ *         content:
+ *           application/json:
+ *             schema:
+ *               type: array
+ *               items:
+ *                 type: object
+ *                 properties:
+ *                   id:
+ *                     type: integer
+ *                   rule:
+ *                     type: string
+ *                   is_active:
+ *                     type: boolean
+ *                   created_at:
+ *                     type: string
+ *                     format: date-time
+ *                   updated_at:
+ *                     type: string
+ *                     format: date-time
+ *       401:
+ *         description: No autorizado
+ *       404:
+ *         description: Plan no encontrado
+ *       500:
+ *         description: Error interno
+ */
+router.get('/:planId/reminders', auth, async (req, res) => {
+  const planId = req.params.planId;
+  const userId = req.user.userId;
+  try {
+    // Verificar que el plan pertenece al usuario
+    const [[plan]] = await pool.query(
+      'SELECT id FROM plans WHERE id = ? AND user_id = ?',
+      [planId, userId]
+    );
+    if (!plan) {
+      return res.status(404).json({ error: 'Plan no encontrado' });
+    }
+
+    // Traer recordatorios
+    const [rows] = await pool.query(
+      `SELECT id, rule, is_active, created_at, updated_at
+         FROM plan_reminders
+        WHERE plan_id = ?`,
+      [planId]
+    );
+    res.json(rows);
+  } catch (err) {
+    console.error(err);
+    res.status(500).json({ error: 'Error al listar recordatorios' });
+  }
+});
+
 module.exports = router;
