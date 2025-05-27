@@ -4,6 +4,7 @@ const express = require('express');
 const pool    = require('../config/db');
 const auth    = require('../middleware/auth');
 const axios   = require('axios');
+const PDFDocument = require('pdfkit');
 
 const router  = express.Router();
 
@@ -605,6 +606,191 @@ router.patch('/:planId/sections/:sectionId', auth, async (req, res) => {
   } catch (err) {
     console.error(err);
     res.status(500).json({ error: 'Error al ajustar sección', details: err.message });
+  }
+});
+
+// ─── Fase 5.1: Generar y guardar resumen ejecutivo ───────────────────────────
+/**
+ * @swagger
+ * /plans/{planId}/summary:
+ *   post:
+ *     summary: Genera y guarda un resumen ejecutivo de un plan
+ *     tags: [Plans]
+ *     security:
+ *       - bearerAuth: []
+ *     parameters:
+ *       - in: path
+ *         name: planId
+ *         schema:
+ *           type: integer
+ *         required: true
+ *         description: ID del plan
+ *     responses:
+ *       200:
+ *         description: Resumen generado y guardado
+ *         content:
+ *           application/json:
+ *             schema:
+ *               type: object
+ *               properties:
+ *                 title:
+ *                   type: string
+ *                 executive_summary:
+ *                   type: string
+ *       401:
+ *         description: No autorizado
+ *       404:
+ *         description: Plan no encontrado
+ *       500:
+ *         description: Error interno
+ */
+router.post('/:planId/summary', auth, async (req, res) => {
+  const planId = req.params.planId;
+  const userId = req.user.userId;
+
+  try {
+    // 1) Traer plan y secciones
+    const [[plan]] = await pool.query(
+      'SELECT title, parameters FROM plans WHERE id = ? AND user_id = ?',
+      [planId, userId]
+    );
+    if (!plan) return res.status(404).json({ error: 'Plan no encontrado' });
+
+    const [sections] = await pool.query(
+      'SELECT section_type, content FROM plan_sections WHERE plan_id = ?',
+      [planId]
+    );
+
+    // 2) Construir prompt y llamar IA
+    const messages = [
+      {
+        role: 'system',
+        content:
+          'Eres un asistente que crea un resumen ejecutivo de un plan. ' +
+          'Devuelve solo un JSON con { title, executive_summary }.'
+      },
+      {
+        role: 'user',
+        content: `Plan: "${plan.title}". Parámetros: ${JSON.stringify(
+          plan.parameters
+        )}. Secciones: ${JSON.stringify(sections)}.`
+      }
+    ];
+
+    const API_BASE = `${req.protocol}://${req.get('host')}`;
+    const aiRes = await axios.post(
+      `${API_BASE}/ai/generate`,
+      { model: 'deepseek-r1-distill-qwen-7b', messages },
+      { headers: { Authorization: req.headers.authorization } }
+    );
+
+    // 3) Parsear JSON del LLM
+    const raw = aiRes.data.choices[0].message.content;
+    const match = raw.match(/\{[\s\S]*\}/);
+    if (!match) {
+      return res
+        .status(500)
+        .json({ error: 'IA no devolvió JSON válido', details: raw.slice(0,200) });
+    }
+    const { title, executive_summary } = JSON.parse(match[0]);
+
+    // 4) Guardar en BD
+    await pool.query(
+      `INSERT INTO plan_summaries (plan_id, title, executive_summary)
+         VALUES (?, ?, ?)`,
+      [planId, title, executive_summary]
+    );
+
+    // 5) Responder al cliente
+    res.json({ title, executive_summary });
+  } catch (err) {
+    console.error(err);
+    res.status(500).json({ error: 'Error al generar resumen', details: err.message });
+  }
+});
+
+// ─── Fase 5.2: Exportar plan a PDF ─────────────────────────────────────────────
+/**
+ * @swagger
+ * /plans/{planId}/export:
+ *   get:
+ *     summary: Devuelve un PDF con el plan completo
+ *     tags: [Plans]
+ *     security:
+ *       - bearerAuth: []
+ *     parameters:
+ *       - in: path
+ *         name: planId
+ *         schema:
+ *           type: integer
+ *         required: true
+ *         description: ID del plan
+ *     responses:
+ *       200:
+ *         description: PDF generado
+ *         content:
+ *           application/pdf: {}
+ *       401:
+ *         description: No autorizado
+ *       404:
+ *         description: Plan no encontrado
+ *       500:
+ *         description: Error interno
+ */
+router.get('/:planId/export', auth, async (req, res) => {
+  const planId = req.params.planId;
+  const userId = req.user.userId;
+
+  try {
+    // 1) Datos del plan
+    const [[plan]] = await pool.query(
+      'SELECT title, status FROM plans WHERE id = ? AND user_id = ?',
+      [planId, userId]
+    );
+    if (!plan) return res.status(404).json({ error: 'Plan no encontrado' });
+
+    // 2) Secciones y último resumen
+    const [sections] = await pool.query(
+      'SELECT section_type, content FROM plan_sections WHERE plan_id = ?',
+      [planId]
+    );
+    const [summaries] = await pool.query(
+      'SELECT executive_summary FROM plan_summaries WHERE plan_id = ? ORDER BY id DESC LIMIT 1',
+      [planId]
+    );
+    const executive = summaries[0]?.executive_summary || '';
+
+    // 3) Generar PDF
+    const doc = new PDFDocument({ margin: 40 });
+    const buffers = [];
+    doc.on('data', (b) => buffers.push(b));
+    doc.on('end', () => {
+      const pdfData = Buffer.concat(buffers);
+      res
+        .writeHead(200, {
+          'Content-Type': 'application/pdf',
+          'Content-Disposition': `attachment; filename=plan-${planId}.pdf`,
+          'Content-Length': pdfData.length
+        })
+        .end(pdfData);
+    });
+
+    // 4) Llenar PDF
+    doc.fontSize(20).text(plan.title, { underline: true });
+    doc.moveDown();
+    doc.fontSize(14).text('Resumen Ejecutivo:', { bold: true });
+    doc.fontSize(12).text(executive);
+    doc.addPage();
+    sections.forEach((s) => {
+      doc.fontSize(16).text(s.section_type, { underline: true });
+      doc.fontSize(12).text(s.content);
+      doc.moveDown();
+    });
+
+    doc.end();
+  } catch (err) {
+    console.error(err);
+    res.status(500).json({ error: 'Error al exportar plan', details: err.message });
   }
 });
 
