@@ -3,6 +3,7 @@
 const express = require('express');
 const pool    = require('../config/db');
 const auth    = require('../middleware/auth');
+const axios   = require('axios');
 
 const router  = express.Router();
 
@@ -415,44 +416,195 @@ router.delete('/:planId', auth, async (req, res) => {
  *         description: Error interno
  */
 router.post('/:planId/sections', auth, async (req, res) => {
-  const planId = req.params.planId;
+  const { planId } = req.params;
+  const userId     = req.user.userId;
 
-  // Verificar que el plan exista y pertenezca al usuario
   try {
+    // 1) Validar plan
     const [plans] = await pool.query(
-      `SELECT id FROM plans WHERE id = ? AND user_id = ?`,
-      [planId, req.user.userId]
+      'SELECT parameters FROM plans WHERE id = ? AND user_id = ?',
+      [planId, userId]
     );
     if (!plans.length) {
       return res.status(404).json({ error: 'Plan no encontrado' });
     }
+    const parameters = plans[0].parameters;
 
-    // Tipos de sección estándar
-    const sectionTypes = ['Profesional','Entrenamiento','Hobbies','Nutrición','Bienestar'];
+    // 2) Construir prompt que fuerce SOLO JSON
+    const messages = [
+      { role: 'system', content:
+          'Eres un asistente que devuelve **solo** JSON puro, sin explicaciones ni etiquetas.' },
+      { role: 'user', content:
+          `Dado este JSON de parámetros: ${JSON.stringify(parameters)}, ` +
+          `devuelve un array JSON con objetos que tengan "section_type" y "content" ` +
+          `para estas secciones: Profesional, Entrenamiento, Hobbies, Nutrición, Bienestar.` }
+    ];
 
-    // Aquí iría la llamada a la IA para generar cada sección.
-    // Por ahora, insertamos contenido placeholder vacío.
-    const insertPromises = sectionTypes.map(type =>
-      pool.query(
-        `INSERT INTO plan_sections (plan_id, section_type, content)
-         VALUES (?, ?, ?)`,
-        [planId, type, `Contenido de ${type} generado por IA...`]
-      )
+    // 3) Llamar al proxy IA
+    const API_BASE = `${req.protocol}://${req.get('host')}`;
+    const aiRes = await axios.post(
+      `${API_BASE}/ai/generate`,
+      { model: 'deepseek-r1-distill-qwen-7b', messages },
+      { headers: { Authorization: req.headers.authorization } }
     );
-    await Promise.all(insertPromises);
 
-    // Recuperar e indicar las secciones creadas
-    const [sections] = await pool.query(
-      `SELECT id, section_type, content, status, created_at, updated_at
-       FROM plan_sections
-       WHERE plan_id = ?`,
+    // 4) Extraer y parsear SOLO el bloque JSON
+    const raw = aiRes.data.choices[0].message.content;
+    const match = raw.match(/\[.*\]/s);
+    if (!match) {
+      return res.status(500).json({
+        error: 'Respuesta IA no contiene JSON',
+        details: raw.slice(0,200)
+      });
+    }
+    const sections = JSON.parse(match[0]);
+
+    // 5) Insertar en BD
+    await Promise.all(sections.map(sec =>
+      pool.query(
+        'INSERT INTO plan_sections (plan_id, section_type, content) VALUES (?, ?, ?)',
+        [planId, sec.section_type, sec.content]
+      )
+    ));
+
+    // 6) Devolver todas las secciones
+    const [result] = await pool.query(
+      'SELECT id, section_type, content, status, created_at, updated_at FROM plan_sections WHERE plan_id = ?',
       [planId]
     );
+    res.json(result);
 
-    res.json(sections);
   } catch (err) {
     console.error(err);
-    res.status(500).json({ error: 'Error al generar secciones del plan' });
+    res.status(500).json({ error: 'Error al generar secciones', details: err.message });
+  }
+});
+
+/**
+ * @swagger
+ * /plans/{planId}/sections/{sectionId}:
+ *   patch:
+ *     summary: Ajusta una sección concreta invocando a la IA
+ *     tags: [Plans]
+ *     security:
+ *       - bearerAuth: []
+ *     parameters:
+ *       - in: path
+ *         name: planId
+ *         schema:
+ *           type: integer
+ *         required: true
+ *         description: ID del plan
+ *       - in: path
+ *         name: sectionId
+ *         schema:
+ *           type: integer
+ *         required: true
+ *         description: ID de la sección
+ *     requestBody:
+ *       required: true
+ *       content:
+ *         application/json:
+ *           schema:
+ *             type: object
+ *             properties:
+ *               comment:
+ *                 type: string
+ *                 example: "Quiero más énfasis en la nutrición"
+ *     responses:
+ *       200:
+ *         description: Sección ajustada correctamente
+ *         content:
+ *           application/json:
+ *             schema:
+ *               type: object
+ *               properties:
+ *                 id:
+ *                   type: integer
+ *                 section_type:
+ *                   type: string
+ *                 content:
+ *                   type: string
+ *                 status:
+ *                   type: string
+ *                 created_at:
+ *                   type: string
+ *                   format: date-time
+ *                 updated_at:
+ *                   type: string
+ *                   format: date-time
+ *       400:
+ *         description: El campo "comment" es obligatorio
+ *       401:
+ *         description: No autorizado
+ *       404:
+ *         description: Plan o sección no encontrado
+ *       500:
+ *         description: Error interno
+ */
+router.patch('/:planId/sections/:sectionId', auth, async (req, res) => {
+  const { planId, sectionId } = req.params;
+  const { comment }           = req.body;
+  const userId                = req.user.userId;
+
+  if (!comment) {
+    return res.status(400).json({ error: 'El campo "comment" es obligatorio' });
+  }
+
+  try {
+    // 1) Validar plan y sección
+    const [[plan]] = await pool.query(
+      'SELECT id FROM plans WHERE id = ? AND user_id = ?',
+      [planId, userId]
+    );
+    if (!plan) {
+      return res.status(404).json({ error: 'Plan no encontrado' });
+    }
+    const [[sec]] = await pool.query(
+      'SELECT content FROM plan_sections WHERE id = ? AND plan_id = ?',
+      [sectionId, planId]
+    );
+    if (!sec) {
+      return res.status(404).json({ error: 'Sección no encontrada' });
+    }
+
+    // 2) Prompt de ajuste – solo JSON puro
+    const messages = [
+      { role: 'system', content:
+          'Eres un asistente de ajustes que devuelve solo el texto ajustado, sin nada más.' },
+      { role: 'user', content:
+          `Texto original: "${sec.content}".\nComentarios: "${comment}".` }
+    ];
+
+    // 3) Llamar al proxy IA
+    const API_BASE = `${req.protocol}://${req.get('host')}`;
+    const aiRes = await axios.post(
+      `${API_BASE}/ai/adjust`,
+      { model: 'deepseek-r1-distill-qwen-7b', messages },
+      { headers: { Authorization: req.headers.authorization } }
+    );
+
+    // 4) Obtener contenido limpio
+    const newContent = aiRes.data.choices[0].message.content.trim();
+
+    // 5) Actualizar BD
+    await pool.query(
+      `UPDATE plan_sections
+         SET content = ?, status = 'adjusted', updated_at = CURRENT_TIMESTAMP
+       WHERE id = ?`,
+      [newContent, sectionId]
+    );
+
+    // 6) Devolver sección actualizada
+    const [[updated]] = await pool.query(
+      'SELECT id, section_type, content, status, created_at, updated_at FROM plan_sections WHERE id = ?',
+      [sectionId]
+    );
+    res.json(updated);
+
+  } catch (err) {
+    console.error(err);
+    res.status(500).json({ error: 'Error al ajustar sección', details: err.message });
   }
 });
 
